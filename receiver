@@ -1,0 +1,345 @@
+/*
+ * ESP32 RECEIVER - Trên cánh tay robot
+ * Nhận dữ liệu ESP-NOW và điều khiển Servo + Stepper
+ */
+
+#include <BluetoothSerial.h>
+#include <AccelStepper.h>
+#include <EEPROM.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
+#endif
+
+#define EEPROM_SIZE 512
+#define POSITION_ADDR 0
+
+#define STEP_PIN 12
+#define DIR_PIN 13
+#define MICROSTEP 4
+#define STEPPERREV 200
+
+#define SCL_PIN 22
+#define SDA_PIN 19
+
+#define SERVO_MIN 150  // 0° position
+#define SERVO_MAX 600  // 180° position
+
+BluetoothSerial SerialBT;
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
+AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+
+// Cấu trúc dữ liệu giống Transmitter
+typedef struct struct_message {
+  uint16_t servo1;
+  uint16_t servo2;
+  uint16_t servo3;
+  uint16_t servo4;
+  uint16_t servo5;
+  int16_t stepper;
+  uint8_t sequence;
+} struct_message;
+
+struct_message controlData;
+
+const int servoPins[5] = { 0, 1, 2, 3, 4 };
+int currentServoPos[5] = { 90, 90, 90, 90, 90 };
+
+
+// Biến kiểm soát
+unsigned long lastReceiveTime = 0;
+const int CONNECTION_TIMEOUT = 1000;  // ms
+uint8_t lastSequence = 0;
+bool newData = false;
+bool isConnected = false;
+long savedPosition = 0;
+// Biến cho việc parse dữ liệu
+String receivedBuffer = "";
+
+
+int angleToPulse(int angle) {
+  return map(angle, 0, 180, SERVO_MIN, SERVO_MAX);
+}
+
+void processData(String data) {
+  data.trim();
+
+  // Kiểm tra xem có phải là JSON không
+  if (data.startsWith("{") && data.endsWith("}")) {
+    // Parse dữ liệu JSON
+    data = data.substring(1, data.length() - 1);
+
+    // Reset dữ liệu cũ
+    memset(&controlData, 0, sizeof(controlData));
+
+    // Tách các cặp key-value
+    int startPos = 0;
+    while (startPos < data.length()) {
+      int commaPos = data.indexOf(',', startPos);
+      String pair;
+      if (commaPos == -1) {
+        pair = data.substring(startPos);
+        startPos = data.length();
+      } else {
+        pair = data.substring(startPos, commaPos);
+        startPos = commaPos + 1;
+      }
+
+      // Tách key và value
+      int colonPos = pair.indexOf(':');
+      if (colonPos > 0) {
+        String key = pair.substring(0, colonPos);
+        key.replace("\"", "");
+        key.trim();
+
+        String valueStr = pair.substring(colonPos + 1);
+        valueStr.trim();
+
+        // Gán giá trị vào struct
+        if (key == "s1") controlData.servo1 = valueStr.toInt();
+        else if (key == "s2") controlData.servo2 = valueStr.toInt();
+        else if (key == "s3") controlData.servo3 = valueStr.toInt();
+        else if (key == "s4") controlData.servo4 = valueStr.toInt();
+        else if (key == "s5") controlData.servo5 = valueStr.toInt();
+        else if (key == "st") controlData.stepper = valueStr.toInt();
+        else if (key == "seq") controlData.sequence = valueStr.toInt();
+      }
+    }
+
+    // Cập nhật thời gian nhận
+    lastReceiveTime = millis();
+
+    // Kiểm tra số thứ tự để tránh xử lý trùng
+    if (controlData.sequence != lastSequence) {
+      lastSequence = controlData.sequence;
+      newData = true;
+
+      // Debug
+      Serial.print("Nhận Seq ");
+      Serial.print(controlData.sequence);
+      Serial.print(": S[");
+      Serial.print(controlData.servo1);
+      Serial.print(",");
+      Serial.print(controlData.servo2);
+      Serial.print(",");
+      Serial.print(controlData.servo3);
+      Serial.print(",");
+      Serial.print(controlData.servo4);
+      Serial.print(",");
+      Serial.print(controlData.servo5);
+      Serial.print("] T:");
+      Serial.println(controlData.stepper);
+    }
+  } else {
+    Serial.println("Dữ liệu không hợp lệ: " + data);
+  }
+}
+
+void checkConnection() {
+  static unsigned long lastCheckTime = 0;
+  const unsigned long CHECK_INTERVAL = 2000;
+
+  if (millis() - lastCheckTime >= CHECK_INTERVAL) {
+    bool wasConnected = isConnected;
+    isConnected = SerialBT.hasClient();
+
+    if (isConnected && !wasConnected) {
+      Serial.println("Đã kết nối Bluetooth!");
+    } else if (!isConnected && wasConnected) {
+      Serial.println("Mất kết nối Bluetooth!");
+      // Dừng các động cơ khi mất kết nối
+      emergencyStop();
+    }
+
+    lastCheckTime = millis();
+  }
+
+  // Kiểm tra timeout dữ liệu
+  if (isConnected && (millis() - lastReceiveTime > CONNECTION_TIMEOUT)) {
+    Serial.println("Timeout - Không nhận được dữ liệu!");
+    // Có thể thêm xử lý dừng khẩn cấp ở đây
+  }
+}
+
+void emergencyStop() {
+  // Dừng stepper
+  stepper.stop();
+
+  // Giữ nguyên vị trí servo hiện tại
+  // Không di chuyển thêm
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+
+  pwm.begin();
+  pwm.setPWMFreq(50);  // 50Hz for servo motors
+
+  for (int i = 0; i < 5; i++) {
+    pwm.setPWM(servoPins[i], 0, angleToPulse(0));
+  }
+
+  EEPROM.begin(EEPROM_SIZE);
+  savedPosition = readPositionFromEEPROM();
+
+  stepper.setMaxSpeed(2000);
+  stepper.setAcceleration(800);
+  stepper.setCurrentPosition(savedPosition);
+
+  Serial.print("Khôi phục vị trí: ");
+  Serial.println(savedPosition);
+
+  // Khởi tạo Bluetooth
+  SerialBT.begin("RobotArm_Receiver");
+  SerialBT.connect("RobotArm_Controller");
+  Serial.println("Receiver đã sẵn sàng!");
+  Serial.println("Đang chờ kết nối từ Controller...");
+  // Wait until the ESP32 Master device connects to this ESP32 Slave
+  while (!SerialBT.connected()) {
+    delay(1000);  // Wait for 1 second before checking again
+    Serial.println("Waiting for RobotArm_Controller to be connected...");
+  }
+
+  Serial.println("Receiver ESP-NOW sẵn sàng chờ dữ liệu...");
+}
+
+void loop() {
+  // Kiểm tra timeout kết nối
+  checkConnection();
+  // Đọc dữ liệu từ Bluetooth
+  while (SerialBT.available()) {
+    char c = SerialBT.read();
+
+    if (c == '\n') {
+      // Kết thúc một gói dữ liệu
+      processData(receivedBuffer);
+      receivedBuffer = "";
+    } else if (c != '\r') {
+      // Thêm vào buffer, bỏ qua ký tự \r
+      receivedBuffer += c;
+
+      // Giới hạn độ dài buffer để tránh tràn
+      if (receivedBuffer.length() > 200) {
+        receivedBuffer = "";
+        Serial.println("Buffer overflow, cleared!");
+      }
+    }
+    newData = true;
+    stepper.run();
+  }
+  // Xử lý dữ liệu mới
+  if (newData) {
+    updateServos();
+    updateStepper();
+    newData = false;
+  }
+
+  // Lưu vị trí định kỳ
+  static unsigned long lastSave = 0;
+  if (millis() - lastSave > 10000) {  // Lưu mỗi 10 giây
+    saveCurrentPosition();
+    lastSave = millis();
+  }
+
+  // Chạy stepper (cần thiết cho AccelStepper)
+  stepper.run();
+}
+
+void updateServos() {
+  // Cập nhật từng servo với tốc độ mượt
+  int targetPositions[5] = {
+    controlData.servo1,
+    controlData.servo2,
+    controlData.servo3,
+    controlData.servo4,
+    controlData.servo5
+  };
+
+  for (int i = 0; i < 5; i++) {
+    // Giới hạn giá trị servo
+    targetPositions[i] = constrain(targetPositions[i], 0, 180);
+
+    // Di chuyển từ từ đến vị trí mới
+    // if (abs(targetPositions[i] - currentServoPos[i]) > 2) {
+    //   // Tăng/giảm dần với tốc độ 2 độ mỗi lần gọi
+    //   if (targetPositions[i] > currentServoPos[i]) {
+    //     currentServoPos[i] += 2;
+    //     if (currentServoPos[i] > targetPositions[i]) {
+    //       currentServoPos[i] = targetPositions[i];
+    //     }
+    //   } else {
+    //     currentServoPos[i] -= 2;
+    //     if (currentServoPos[i] < targetPositions[i]) {
+    //       currentServoPos[i] = targetPositions[i];
+    //     }
+    //   }
+    // pwm.setPWM(servoPins[i], 0, angleToPulse(currentServoPos[i]));
+    // } else {
+    // Đến đích
+    currentServoPos[i] = targetPositions[i];
+    pwm.setPWM(servoPins[i], 0, angleToPulse(currentServoPos[i]));
+    // }
+  }
+}
+
+
+void updateStepper() {
+  // Điều khiển stepper theo giá trị (0 đến 270 do)
+  int angle = controlData.stepper;
+  angle = constrain(angle, 0, 270);
+  stepper.moveTo((long)((float)angle / 360.0 * MICROSTEP * STEPPERREV));
+}
+
+void saveCurrentPosition() {
+  long currentPos = stepper.currentPosition();
+  long maxPosition = (long)(270.0 / 360.0 * MICROSTEP * STEPPERREV);
+
+  // Chỉ lưu nếu vị trí hợp lệ
+  if (currentPos >= 0 && currentPos <= maxPosition) {
+    EEPROM.put(POSITION_ADDR, currentPos);
+    if (EEPROM.commit()) {
+      Serial.print("Đã lưu vị trí stepper: ");
+      Serial.println(currentPos);
+    } else {
+      Serial.println("Lỗi khi lưu vào EEPROM!");
+    }
+  } else {
+    Serial.print("Vị trí không hợp lệ: ");
+    Serial.println(currentPos);
+  }
+}
+
+long readPositionFromEEPROM() {
+  long pos;
+  EEPROM.get(POSITION_ADDR, pos);
+
+  long maxPosition = (long)(270.0 / 360.0 * MICROSTEP * STEPPERREV);
+
+  // Kiểm tra giá trị đọc được có hợp lệ không
+  if (pos < 0 || pos > maxPosition) {
+    Serial.println("Dữ liệu EEPROM không hợp lệ, reset về 0");
+    return 0;
+  }
+
+  return pos;
+}
+
+// Hàm kiểm tra kết nối Bluetooth
+void connectToController() {
+  static unsigned long lastConnectAttempt = 0;
+  const unsigned long CONNECT_INTERVAL = 5000;  // 5 giây
+
+  if (!isConnected && (millis() - lastConnectAttempt >= CONNECT_INTERVAL)) {
+    Serial.println("Đang thử kết nối đến Controller...");
+
+    // Thử kết nối đến Transmitter (nếu biết địa chỉ)
+    // bool connected = SerialBT.connect("RobotArm_Controller");
+
+    lastConnectAttempt = millis();
+  }
+}

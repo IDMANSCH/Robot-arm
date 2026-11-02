@@ -1,6 +1,6 @@
 /*
- * ESP32 TRANSMITTER - Điều khiển từ xa dùng Bluetooth Serial
- * Với 6 biến trở, gửi dữ liệu đến Receiver qua Bluetooth
+ * ESP32 TRANSMITTER - Bluetooth Serial Remote Control
+ * Uses 6 potentiometers to send data to the Receiver via Bluetooth
  */
 
 #include <BluetoothSerial.h>
@@ -10,10 +10,10 @@
 #endif
 
 BluetoothSerial SerialBT;
-// Tên thiết bị Bluetooth
+// Bluetooth device name
 const char* deviceName = "RobotArm_Controller";
 
-// Cấu trúc dữ liệu gửi đi
+// Data structure for transmission
 typedef struct struct_message {
   uint16_t servo1;   // 0-180
   uint16_t servo2;   // 0-180
@@ -21,22 +21,22 @@ typedef struct struct_message {
   uint16_t servo4;   // 0-180
   uint16_t servo5;   // 0-180
   int16_t stepper;   // -100 đến 100
-  uint8_t sequence;  // Số thứ tự gói tin
+  uint8_t sequence;  // Packet sequence number
 } struct_message;
 
 struct_message controlData;
 
-// Chân biến trở
+// Potentiometer pins
 const int potPins[6] = { 13, 14, 27, 26, 25, 33 };
 int potValues[6] = { 0 };
 int lastPotValues[6] = { 0 };
 
-// Trạng thái kết nối Bluetooth
+// Bluetooth connection status
 bool isConnected = false;
 unsigned long lastConnectionCheck = 0;
 const int CONNECTION_CHECK_INTERVAL = 2000;  // ms
 
-// Biến kiểm soát thời gian
+// Timing control variables
 unsigned long lastSendTime = 0;
 const int SEND_INTERVAL = 100;  // ms
 uint8_t sequenceNum = 0;
@@ -44,7 +44,7 @@ uint8_t sequenceNum = 0;
 void setup() {
   Serial.begin(115200);
 
-  // Khởi tạo Bluetooth Serial
+  // Initialize Bluetooth Serial
   SerialBT.begin(deviceName, true);
   Serial.println("Bluetooth Serial đã khởi tạo");
   Serial.print("Tên thiết bị: ");
@@ -55,7 +55,7 @@ void setup() {
     delay(1000);
   }
 
-  // Cấu hình chân analog
+  // Configure analog pins
   for (int i = 0; i < 6; i++) {
     pinMode(potPins[i], INPUT);
     lastPotValues[i] = analogRead(potPins[i]);
@@ -68,17 +68,17 @@ void loop() {
   checkBluetoothConnection();
 
   if (isConnected) {
-    // Đọc giá trị biến trở
+    // Read potentiometer values
     readPotentiometers();
 
-    // Gửi dữ liệu định kỳ
+    // Send data periodically
     if (millis() - lastSendTime >= SEND_INTERVAL) {
       prepareData();
       sendData();
       lastSendTime = millis();
     }
   } else {
-    // Khi chưa kết nối, đọc và hiển thị giá trị biến trở (debug)
+    // Read and display potentiometer values when disconnected (debug)
     if (millis() - lastSendTime >= 1000) {
       readPotentiometers();
       prepareData();
@@ -98,7 +98,7 @@ void loop() {
     }
   }
 
-  delay(1);  // Giảm CPU usage
+  delay(1);  // Reduce CPU usage
 }
 
 void checkBluetoothConnection() {
@@ -117,7 +117,7 @@ void readPotentiometers() {
   for (int i = 0; i < 6; i++) {
     int rawValue = analogRead(potPins[i]);
 
-    // Lọc nhiễu bằng moving average
+    // Noise filtering using moving average
     if (abs(rawValue - lastPotValues[i]) > 8 || abs(rawValue - lastPotValues[i]) < 30) {
       lastPotValues[i] = rawValue;
       potValues[i] = rawValue;
@@ -133,7 +133,7 @@ void readPotentiometers() {
 }
 
 void prepareData() {
-  // Ánh xạ 5 biến trở đầu thành giá trị servo (0-180)
+  // Map the first 5 potentiometers to servo values (0-180)
   for (int i = 0; i < 5; i++) {
     int value = map(potValues[i], 0, 4095, 0, 180);
     value = constrain(value, 0, 180);
@@ -147,18 +147,18 @@ void prepareData() {
     }
   }
 
-  // Biến trở thứ 6 cho stepper (-100 đến 100)
+  // Sixth potentiometer controls the stepper (-100-100)
   int stepperVal = map(potValues[5], 0, 4095, 0, 270);
   stepperVal = constrain(stepperVal, 0, 270);
   controlData.stepper = stepperVal;
 
-  // Tăng số thứ tự
+  // Increment packet sequence number
   controlData.sequence = sequenceNum++;
   if (sequenceNum > 255) {
     sequenceNum = 0;
   }
 
-  // Hiển thị debug
+  // Debug output
   Serial.print("Servo: ");
   Serial.print(controlData.servo1);
   Serial.print(", ");
@@ -178,7 +178,7 @@ void prepareData() {
 void sendData() {
   if (!isConnected) return;
 
-  // Gửi dữ liệu dưới dạng chuỗi JSON để dễ xử lý
+  // Send data as a JSON string for easier processing
   String dataString = "{";
   dataString += "\"s1\":" + String(controlData.servo1) + ",";
   dataString += "\"s2\":" + String(controlData.servo2) + ",";
@@ -191,7 +191,7 @@ void sendData() {
 
   SerialBT.print(dataString);
 
-  // Debug
+  // Debug output
   Serial.print("Gửi: ");
   Serial.print(dataString);
 }
